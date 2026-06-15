@@ -105,26 +105,42 @@
 
 ### 06/10（周三）— Chunked Prefill 的成本与收益权衡
 
-> **📋 题干**
+**📋 题干（完整原文）**
 
-> **背景**：7B FP16 模型部署在单张 A100 80GB 上。Prefill 吞吐 ~6,000 tok/s（compute-bound），Decode TPOT（batch=16）~30ms（memory-bound）。流量：50% 短请求（512 tokens input + 128 output）和 50% 长请求（4K tokens input + 128 output）。
+**背景**：7B FP16 模型部署在单张 A100 80GB 上。流量包含两类请求：短请求 S（512 tokens input + 128 output）和长请求 L（4K tokens input + 128 output），各占 50%。
 
-> **Q1：长请求 prefill 期间发生了什么？**
-> (a) 4K 长请求的 prefill 需要多少连续 GPU 时间？
-> (b) 在此期间同 batch 中 decode 的短请求 TPOT 会变成多少？
-> (c) 如果有 8 个短请求在 decode，这批请求的 P99 TPOT 会受多大影响？
+| 参数 | 值 | 说明 |
+|------|------|------|
+| 模型 | 7B FP16 | 单张 A100 80GB |
+| Prefill 吞吐 | ~6,000 tok/s | compute-bound |
+| Decode TPOT（batch=16） | ~30ms | memory-bound |
+| 流量 | 50% 短请求（512+128）+ 50% 长请求（4K+128） | — |
+| 并发 | 假设 16 请求全满 | — |
 
-> **Q2：Chunked Prefill 的平滑效果**
-> 开启 chunked prefill（chunk=256 tokens），假设 chunked prefill throughput 是全量 prefill 的 60%。
-> (a) 每个 chunk 的 prefill 时间？
-> (b) decode 请求的 TPOT 变成多少？
-> (c) 长请求的总 prefill 时间变成多少？
-> (d) 用一句话总结 chunked prefill 的收益和代价。
+**Q1：长请求 prefill 期间发生了什么？**
 
-> **Q3：最优 Chunk Size**
-> 若 chunk size 可选 128/256/512/1024，对应 throughput 分别为 40%/60%/75%/90% 的全量效率，如何选择？选择在什么条件下会变？
+(a) 4K 长请求的 prefill 需要多少连续 GPU 时间？
+(b) 在此期间同 batch 中 decode 的短请求 TPOT 会变成多少？
+(c) 如果有 8 个短请求在 decode，这批请求的 P99 TPOT 会受多大影响？
 
-**核心考点**：Chunked Prefill 的 TTFT↔TPOT 权衡；blocking 机制的本质变化；chunk size 光谱选择。
+**Q2：Chunked Prefill 的平滑效果**
+
+开启 chunked prefill（chunk=256 tokens），假设 chunked prefill throughput 是全量 prefill 的 60%。
+
+(a) 每个 chunk 的 prefill 时间？
+(b) decode 请求的 TPOT 变成多少？
+(c) 长请求的总 prefill 时间变成多少？
+(d) 用一句话总结 chunked prefill 的收益和代价。
+
+**Q3：最优 Chunk Size**
+
+若 chunk size 可选 128/256/512/1024，对应 throughput 分别为 40%/60%/75%/90% 的全量效率。
+
+(a) 在短请求 TPOT 优先的场景下，应选哪个 chunk size？
+(b) 在长请求 TTFT 优先的场景下呢？
+(c) GQA（8 KV heads vs 32 MHA heads）对 chunk size 选择范围有什么影响？
+
+**核心考点**：Chunked Prefill 的 TTFT↔TPOT 权衡；blocking 机制的本质变化；chunk size 光谱选择；GQA 对 KV Cache 的影响。
 
 **标准答案**：
 
@@ -140,24 +156,87 @@
 
 > **严谨性说明**：原题设定被 preempt 请求占用 64 blocks 与 4K prompt 物理不自洽（64×16=1,024 < 4,096），已修正为 288 blocks（256 for prompt + 32 for decode）。
 
-> **📋 题干**
+**📋 题干（完整原文）**
 
-> **背景**：Qwen2-72B（FP16，GQA，n_kv_heads=8，d_head=128，layers=80），2×A100 80GB（TP=2，NVLink），vLLM：max_num_seqs=128，max_model_len=16384，gpu_memory_utilization=0.9。峰值并发 ~110 请求。TTFT 从 1.2s → 8~15s，P99 TPOT 从 45ms → 120ms，高频出现 preemption 日志。
+> **难度**：⭐⭐⭐⭐ | **标签**：#vLLM #Scheduler #Preemption #KVCache #Serving
 
-> **Q1：Preemption 成本估算**
-> block_size=16，被 preempt 请求已占用 64 blocks（prompt prefill 完成，处于 decode 阶段）：
-> (a) 这个请求的 GPU KV Cache 占多少 MiB？（公式：2×layers×n_kv_heads×d_head×block_size×num_blocks×dtype_bytes）
-> (b) 若 swap，通过 PCIe 4.0 x16（~20 GB/s）的传输时间？
-> (c) 若 recompute，prompt 4K tokens、prefill throughput ~150K tok/s（FP16，TP=2），recompute 时间？
-> (d) Swap vs Recompute 综合判断：各自在什么条件下更优？block 数翻倍（128 blocks）结论会变吗？
+**背景**：你负责维护一个线上推理服务，配置如下：
+- 模型：Qwen2-72B (FP16, GQA, n_kv_heads=8, d_head=128, layers=80)
+- GPU：2×A100 80GB（TP=2，NVLink 互联）
+- vLLM 配置：max_num_seqs=128，max_model_len=16384，gpu_memory_utilization=0.9
+- 峰值并发：~110 个请求同时在线
 
-> **Q2：调度逻辑代码 Review**
-> 给定简化版 vLLM Scheduler preemption 代码（swap_out_threshold=64），找出至少 3 处工程问题。关键审查位置：[1] swap 只取末尾 N blocks、[2] swap 后放回 running、[3] swapped 状态仍留在 running。
+最近用户投诉高峰时段体验大幅劣化：
+- TTFT 从平均 1.2s → 8~15s
+- P99 TPOT 从 45ms → 120ms
+- 服务日志高频出现 `Sequence group preemption detected`，伴随大量 `Swapping blocks to CPU`
 
-> **Q3：方案设计**
-> (a) 日志显示被 preempt 的几乎全是长 prompt 新请求（8K~16K），这合理吗？
-> (b) max_num_seqs=128 合理吗？估算每请求平均可用多少 KV Cache block，是否支持 max_model_len=16384？
-> (c) Prefix Cache 启用后，多个请求共享 prefix blocks 时 preempt 如何处理共享 blocks？
+**问题 1：Preemption 成本估算（计算分析）**
+
+vLLM 有两种 preemption 模式：swap（将 KV Cache 搬到 CPU）和 recompute（释放 block，下次重新 prefill）。假设 block_size=16，一个被 preempt 的请求目前已占用 64 个 block（prompt 已全部 prefill 完成，处于 decode 阶段）。
+
+(a) 这个请求的 KV Cache 在 GPU 上占多少 MiB？（公式：2 × layers × n_kv_heads × d_head × block_size × num_blocks × dtype_bytes）
+
+(b) 如果采用 swap preemption，通过 PCIe 4.0 x16 将这 64 个 block 全部 swap 到 CPU，理论传输时间是多少？（假设 PCIe 4.0 x16 有效单向带宽 ~20 GB/s）
+
+(c) 如果采用 recompute preemption，假设原 prompt 长度为 4K tokens，A100 单卡的 prefill throughput 约为 150K tokens/s（FP16，TP=2），recompute 需要多长时间？
+
+(d) 综合判断：给定上述计算，swap 和 recompute 分别在什么条件下更优？如果 block 数翻倍（128 blocks），结论会变吗？
+
+**问题 2：调度逻辑代码 Review（代码审查）**
+
+下面是一段简化版的 vLLM Scheduler preemption 逻辑，请找出至少 3 处工程问题：
+
+```python
+class Scheduler:
+    def __init__(self, block_manager, swap_out_threshold=64):
+        self.block_manager = block_manager
+        self.running: list[SeqGroup] = []
+        self.waiting: list[SeqGroup] = []
+        self.swap_out_threshold = swap_out_threshold
+
+    def preempt(self, victim: SeqGroup, blocks_needed: int):
+        """从 victim 抢占 blocks_needed 个 block 给新请求"""
+        if victim.num_blocks < self.swap_out_threshold:
+            # === 方案 A: recompute ===
+            victim.state = "recompute"
+            self.block_manager.free(victim.seq_ids)
+            self.waiting.append(victim)  # 放回队尾
+        else:
+            # === 方案 B: swap ===
+            blocks_to_swap = victim.block_ids[-blocks_needed:]  # [1]
+            self.block_manager.swap_out(blocks_to_swap, "cpu")
+            victim.block_ids = victim.block_ids[:-blocks_needed]
+            if len(victim.block_ids) > 0:
+                self.running.append(victim)  # [2]
+            else:
+                victim.state = "swapped"
+                self.running.append(victim)  # [3]
+```
+
+逐行审查标注了 [1]、[2]、[3] 的位置以及更大的策略问题。你觉得哪里有问题？
+
+**问题 3：方案设计**
+
+(a) 日志显示被 preempt 的请求几乎全是长 prompt 的新请求（输入 8K~16K tokens），短对话很少被 preempt。这合理吗？为什么？vLLM 的调度策略是否应该优先保护短对话？
+
+(b) 你认为 max_num_seqs=128 设置合理吗？如果 gpu_memory_utilization=0.9，请你粗略估算这个配置下每请求平均可用多少 KV Cache block，是否足够支持 max_model_len=16384？
+
+(c) 如果启用了 Prefix Cache，多个请求共享同一 prefix 的 block。preempt 其中一个请求时，这些共享 block 应该怎么处理？释放还是不释放？
+
+**应用场景**：Preemption 是 vLLM/SGLang/TGI 等 serving 框架应对显存超载的"安全阀"。频繁 preemption 会直接击穿 TTFT 和 TPOT 的 SLA。理解 preemption 的成本构成、选择合适的策略、优化调度优先级，是线上推理服务调优绕不开的核心课题。
+
+**优化方向**
+| 层级 | 优化思路 |
+|------|----------|
+| 调度策略 | 优先级队列（长 prompt 降权）、max_num_seqs 动态调整、preemption 保护短请求 |
+| 显存管理 | Prefix Cache 减少重复 KV、更好的 block 分配算法、block_size 调优 |
+| 通信优化 | GPU→CPU swap 的 PCIe 瓶颈 → SSD/NVMe offload？→ 压缩传输？ |
+| 策略组合 | 混合 preemption：小 prompt 用 recompute（快），长 prompt 用 swap（省） |
+
+**诚实边界**
+- GPU↔CPU 的 PCIe 带宽强烈依赖拓扑（是否经过 P2P switch、是否同一 NUMA node、是否被其他 GPU 共享带宽）。20 GB/s 是一个乐观估算，生产环境实测可能只有 10~14 GB/s。建议用 cudaMemcpy + nvbandwidth 在你自己的集群上跑一下。
+- 不同模型架构（Dense vs MoE）的 preemption 行为会有差异，尤其 MoE 模型每层 expert 参数量大，recompute 成本会更高，swap 的相对优势更明显。
 
 **核心考点**：KV Cache 计算、swap/recompute 成本对比、victim 选择、preemption 代码实现。
 
@@ -190,9 +269,151 @@
 
 ---
 
-### 06/12~06/14（周五~周日）
+### 06/12（周五）— Chunked Prefill 的调度博弈
 
-> **诚实说明**：用户尚未查看这几天的题目，本周复盘仅覆盖 06/08~06/11 的讨论内容。
+**📋 题干（完整原文）**
+
+> **难度**：⭐⭐⭐ | **标签**：#ChunkedPrefill #Scheduler #vLLM #SGLang #TTFT #TPOT
+
+**应用场景**：你的团队用 vLLM 部署了 Llama3-70B 推理服务。线上流量包含大量长文档分析请求（输入 > 16K tokens）和实时对话请求（短输入、低延迟要求）。近期运维反馈：长请求一多，所有用户的打字机输出都变得一顿一顿的，TPOT 飙到 200ms+，但直接关掉 chunked prefill 又导致 TTFT 爆炸。
+
+**背景假设**
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 模型 | Llama3-70B, FP16, GQA (n_kv_heads=8, d_head=128), 80 layers | — |
+| 硬件 | 8×A100 80GB, TP=4 | per-replica 4 GPU |
+| 显存 | gpu_memory_utilization=0.9 | weights ≈ 35 GB/GPU, KV Cache budget ≈ 37 GB/GPU |
+| Prefill 吞吐 | ~4,000 tok/s/GPU (FP16, TP=4, 连续 batching 下的均值) | **估算值** |
+| Decode 单步延迟 | ~40ms (TP=4, batch=64) | **估算值** |
+| 流量画像 | 30% 长文档 (32K input, 500 output) + 70% 短请求 (512 input, 256 output) | 峰值 ~32 并发，其中同时约 8-10 个长请求 |
+
+**问题 1：TTFT 计算分析**
+
+(a) 不开启 chunked prefill 时，一个 32K token 请求的 prefill 耗时多长？这期间同 batch 的其他 decode 请求的 TPOT 会变成多少？
+
+(b) 开启 chunk_size=4096 后，这个 32K 请求被拆成几个 chunk？每个 chunk 处理期间，同 batch 的 decode 请求大约能跑几步？
+
+(c) 对比 chunk_size=512 vs chunk_size=4096 对长请求 TTFT 和短请求 P99 TPOT 的各自影响。用数字说话。
+
+**问题 2：调度策略 Review**
+
+你同事写了下面这段简化调度逻辑：
+
+```python
+def schedule(ready_queue, running_seqs, max_num_seqs):
+    prefill = [r for r in ready_queue if r.is_prefill]
+    decode = [r for r in ready_queue if not r.is_prefill]
+    batch = []
+
+    # 先把所有 prefill 都塞进 batch
+    while prefill and len(batch) < max_num_seqs:
+        batch.append(prefill.pop(0))
+
+    # 剩余容量给 decode
+    while decode and len(batch) < max_num_seqs:
+        batch.append(decode.pop(0))
+
+    return batch
+```
+
+(a) 这段调度逻辑在 chunked prefill 开启时会有什么问题？试想 8 个长请求同时到达的场景。
+
+(b) 如果 batch 被 8 个 prefill chunk 占满，decode 请求完全进不来——这种饥饿状态会持续多久？如何从调度策略层面避免？
+
+(c) vLLM 和 SGLang 在 prefill/decode 混合调度上的思路有什么本质区别？
+
+**问题 3：Benchmark 设计**
+
+Leader 让你给出"当前流量下最优的 chunk_size"。
+
+(a) 设计 benchmark，需要覆盖哪些 workload 维度？
+
+(b) 除了 TTFT / TPOT / OTPS，还需要采集哪些指标才能完整评估 chunked prefill 的效果？
+
+(c) 实测发现：chunk_size=512 相比 4096，长请求 P99 TTFT 从 12s 升到 18s，但短请求 P99 TPOT 从 120ms 降到 55ms。你会建议用哪个值？理由是什么？如果 SLA 是 "TTFT < 15s 且 TPOT < 80ms"，答案会变吗？
+
+**诚实边界**
+
+- Prefill 吞吐 4000 tokens/s 是 **估算**，实际受 batch 组成、FlashAttention 对 O(n²) 的缓解程度、chunk_size、GPU 降频等影响，波动范围 2000-6000 tokens/s
+- Decode 步延迟 40ms 是 **估算**，随 batch_size 增大线性增加。上述计算假设 batch 基本稳定
+- 调度器伪代码做了大量 **教学简化**，vLLM v0.6.x 和 SGLang v0.3.x 的调度器实现差异较大
+- 最优 chunk_size 必须通过实际 A/B 测试验证，本题目的是建立分析框架
+
+**优化方向**
+
+| 层级 | 优化思路 |
+|------|----------|
+| 框架/调度层 | chunk_size 自适应调节、request-aware 调度（长/短请求分离调度）、优先级队列 |
+| 系统层 | PD 分离——从根本上解耦 prefill 和 decode，让两种请求各跑各的 GPU |
+
+**核心考点**：Chunked Prefill 的 TTFT↔TPOT 光谱权衡；调度器中 prefill/decode slot 分配的优先级反转问题；单一 chunk size 在双 SLA 约束下的局限性；SGLang Stream 模型 vs vLLM SeqGroup 模型的调度差异。
+
+**标准答案**：
+
+**Q1：TTFT 计算分析**
+
+- Q1(a) 无 chunked prefill：
+  - 32K prefill = 32,000 / 4,000 = **8 秒**
+  - 这 8 秒内 GPU 全程 prefill，decode 一步不能跑 → 同 batch decode TPOT = **8,000 ms**
+  - 生产灾难性——打一个字等 8 秒
+
+- Q1(b) Chunked prefill, chunk=4096：
+  - 拆成 32,000 / 4,096 ≈ **8 个 chunk**
+  - 每 chunk 时间：4,096 / (4,000×90%) ≈ **1.14s**
+  - 每 step prefill chunk + decode 混合 → 8 步内 decode 推进 **8 个 token**
+
+- Q1(c) 对比：
+
+| Chunk size | 有效 throughput | 长请求 TTFT | 短请求 TPOT |
+|-----------|----------------|------------|------------|
+| 无 chunked | 4,000 tok/s | **8.0s** | **8,000ms** |
+| 4096 | ~3,600 tok/s (90%) | **9.1s** (+14%) | **1,140ms** (28×正常) |
+| 512 | ~2,400 tok/s (60%) | **13.4s** (+67%) | **210ms** (5×正常) |
+
+**Q2：调度策略 Review**
+
+- Q2(a) 问题：**优先级反转**——代码先塞满 prefill chunk 再给 decode，8 个长请求（64 个 chunk）可以连续多轮霸占全部 slot，decode **完全进不来**
+  - Starvation 持续：8 轮 × 1.14s ≈ **9 秒**
+
+- Q2(b) 正确做法——**先预留 decode slot**：
+  ```python
+  min_decode_slots = 4  # 保证每轮 decode 不被饿死
+  batch += decode[:min_decode_slots]
+  batch += prefill[:max_num_seqs - len(batch)]
+  ```
+  更精确：用 token budget（`max_num_batched_tokens`）控制每轮 prefill token 总量
+
+- Q2(c) vLLM vs SGLang 本质区别：
+
+| 维度 | vLLM | SGLang |
+|------|------|--------|
+| 调度单位 | **SeqGroup**（请求级） | **Stream**（流式执行上下文） |
+| Prefix 感知 | 调度层和 cache 层解耦 | **深度耦合**——RadixCache 直接影响调度决策 |
+| 核心机制 | Token budget 分配 | Stream 编排，可在 RadixCache 节点 fork/join |
+| 多请求共享 | BlockManager 处理，调度器无感知 | 调度器**显式感知**共享 prefix → 自动聚簇 |
+| Preemption 粒度 | 请求级 | 更细（stream fork 可独立管理） |
+
+**Q3：Benchmark 设计**
+
+- Q3(a) Workload 维度：请求长度分布（纯短/混合/纯长）、并发度（低/中/高）、到达模式（稳态/burst）、chunk size（无/512/1024/2048/4096）、prefix 共享度（0%/50%/80%）
+
+- Q3(b) 额外指标：Prefill 有效 throughput、GPU 利用率（compute vs memory）、decode starvation 时长、prefill chunk 排队深度、batch 组成（prefill/decode tokens 占比）、P99/P99.9 尾部延迟、Jitter（TPOT 标准差）
+
+- Q3(c) 双 SLA 下（TTFT<15s 且 TPOT<80ms）：
+  - Chunk=512：TTFT=18s > 15s ❌
+  - Chunk=4096：TPOT=120ms > 80ms ❌
+  - **两者都不满足** → 需要 PD 分离、请求感知调度（长请求大 chunk、短请求小 chunk）、或自适应 chunk size
+
+**用户讨论亮点**：
+- 用户准确指出"chunked prefill 在分离式场景没有收益"，并追问 PD 分离场景开启 chunked prefill 的目的——dodo 解释在 PD 分离下 chunked prefill 的角色从"保护 decode TPOT"变为"细粒度 prefill 任务调度 + 减少 pipeline bubble + 平滑 KV 传输"
+- 用户追问 SGLang Stream 模型，dodo 用 RadixCache fork/join 类比解释了 vLLM SeqGroup vs SGLang Stream 的本质差异
+
+---
+
+### 06/13~06/14（周六~周日）
+
+> **诚实说明**：用户尚未查看这几天的题目。每日推理一题定时任务已按计划生成题目，但用户在本次周复盘期间尚未回顾 06/13 和 06/14 的内容。本周完整学习内容覆盖 06/08~06/12 的问答记录，其中 06/12 为本周重点讨论。
 
 ---
 
@@ -232,13 +453,27 @@
 
 5. **数值自洽是出题底线**——64 blocks × 16 tokens/block = 1,024 < 4K prompt，物理不自洽导致整道题的分析失去根基。
 
+### 2.4 Chunked Prefill 的调度博弈
+
+1. **Chunked Prefill 的本质是 TTFT↔TPOT 光谱权衡，不是开关**——chunk size 是一个连续光谱，大 chunk 保 TTFT 但 TPOT 差，小 chunk 反之。不存在全局最优值，最优值由 SLA 优先级和 workload 组成决定。
+
+2. **调度器优先级反转是 chunked prefill 场景下 decode starvation 的关键根因**——"先塞 prefill 再给 decode"的策略导致 8 个长请求可以连续 9 秒让 decode 进不来。正确做法是**先预留 decode slot**（min_decode_slots），剩余 budget 再分配 prefill。
+
+3. **vLLM 和 SGLang 的调度哲学差异**——vLLM 以 SeqGroup 为调度单位 + token budget 分配机制（调度层和 cache 层解耦）；SGLang 以 Stream 为调度单位 + RadixCache 深度耦合（调度器显式感知 prefix 共享，可自动聚簇调度）。
+
+4. **单一 chunk size 无法同时满足 TTFT 和 TPOT 双 SLA**——当 SLA 为 TTFT<15s 且 TPOT<80ms 时，chunk=512 和 chunk=4096 均不满足。这指向更高阶方案：PD 分离（从根本上解耦）、请求感知调度（长/短请求分不同 chunk size）、或自适应 chunk size。
+
+5. **SGLang Stream 模型的核心优势**——stream 是轻量执行上下文，可在 RadixCache 节点上 fork/join，支持细粒度调度、prefix 感知聚簇、beam search 分支独立管理。相比 vLLM 的请求级调度粒度更细。
+
 ---
 
 ## 3. 本周掌握得不错的点
 
-1. **Chunked Prefill 的核心 trade-off 理解到位**——用户能准确指出无 Chunked Prefill 时 S 的 TPOT 应为 667+25=692ms（包含 preemption 等待时间和正常 decode 时间），说明对 prefill 阻塞 decode 的机制理解清晰。
+1. **Chunked Prefill 的核心 trade-off 理解到位**——用户能准确指出无 Chunked Prefill 时 S 的 TPOT 应为 667+25=692ms，并在 06/12 题目中进一步指出 chunk size 光谱的本质是 TTFT↔TPOT 的连续权衡。
 
-2. **KV Cache 计算熟练**——用户能独立完成 2×layers×n_kv_heads×d_head×dtype_bytes 的计算，并正确考虑 TP=2 的切分。
+2. **对 PD 分离场景下 Chunked Prefill 的独特视角**——用户准确指出"chunked prefill 在分离式场景没有收益"，并追问 PD 分离场景开启 chunked prefill 的目的，说明能区分集中式 vs 分离式部署下同一技术的不同作用机制。
+
+3. **KV Cache 计算熟练**——用户能独立完成 2×layers×n_kv_heads×d_head×dtype_bytes 的计算，并正确考虑 TP=2 的切分。
 
 3. **Swap vs Recompute 的 crossover 分析到位**——用户理解 crossover 在高带宽访存快于计算时 swap 优、算力强计算快于访存时 recompute 优。同时指出 `blocks/ms 应该是常数`，说明对线性关系的本质有准确直觉。
 
@@ -369,7 +604,7 @@ max_num_seqs=96 × 平均~421 blocks/请求 > 36,500 总 blocks
 
 1. **深入 Preemption 的生产实践**：从代码层面验证 vLLM 实际的 preemption 实现（`vllm/v1/core/scheduler.py` 中的 `_preempt()` 逻辑）。
 
-2. **补齐 06/12~06/14 的题目**：回顾这几天的题目，检验本周的理论理解。
+2. **补齐 06/13~06/14 的题目**：本周已完整回顾 06/08~06/12 共 5 道题，06/13~06/14 的题目尚未查看。建议从这两天的题目入手，检验对 PD 分离、CUDA Graph 等高阶主题的理解。
 
 3. **尝试 PD 分离专题**：Preemption 策略在 PD 分离架构下会有本质不同（KV Cache 传输受网络带宽约束）。
 
